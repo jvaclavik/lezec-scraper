@@ -33,7 +33,117 @@ const client = axios.create({
   },
 });
 
-// fetch detail cesty
+// --- Types ---
+type Climb = {
+  date: string;
+  route: string;
+  area: string;
+  originGrade: string;
+  suggestedGrade?: string;
+  points: string;
+  style: string;
+  routeKey: string;
+  partners?: string;
+  note?: string;
+  attempts?: number;
+  public: boolean;
+  sector?: string;
+  location?: string;
+};
+
+// --- Helpers ---
+async function login(username: string, password: string) {
+  const loginResponse = await client.post(
+    LOGIN_URL,
+    new URLSearchParams({
+      login: "2",
+      uid: username,
+      hes: password,
+      x: "10",
+      y: "10",
+    }),
+    { responseType: "arraybuffer" }
+  );
+
+  const cookies = loginResponse.headers["set-cookie"];
+  if (!cookies) throw new Error("❌ Login failed – no cookies received.");
+  client.defaults.headers.Cookie = cookies.join("; ");
+  console.log("✅ Logged in to Lezec.cz");
+}
+
+function parseGrade(raw: string): {
+  originGrade: string;
+  suggestedGrade?: string;
+} {
+  const match = raw.match(/^(.+?)\s*\[(.+?)\]$/);
+  if (match) {
+    return { suggestedGrade: match[1].trim(), originGrade: match[2].trim() };
+  }
+  return { originGrade: raw };
+}
+
+function parseTitle(title: string): { partners?: string; note?: string } {
+  if (!title) return {};
+  const parts = title.split(" - ");
+  return {
+    partners: parts[0]?.trim(),
+    note: parts[1]?.trim(),
+  };
+}
+
+function parseDiary(html: string): Climb[] {
+  const $ = cheerio.load(html);
+  const climbs: Climb[] = [];
+
+  $("table tr").each((_, row) => {
+    const tds = $(row).find("td");
+    if (tds.length >= 6) {
+      const date = $(tds[0]).text().trim();
+      if (!date.match(/^\d{2}\.\d{2}\.\d{4}$/)) return;
+
+      const link = $(tds[1]).find("a");
+      const href = link.attr("href") || "";
+      const title = link.attr("title") || "";
+      const mkey = href.match(/key=(\d+)/);
+      const routeKey = mkey ? mkey[1] : "";
+
+      const route = $(tds[1]).text().trim();
+      const area = $(tds[2]).text().trim();
+      const gradeRaw = $(tds[3]).text().trim();
+      const points = $(tds[4]).text().trim();
+      const style = $(tds[5]).text().trim();
+      const attemptsText = tds[6] ? $(tds[6]).text().trim() : "";
+      const publicText = tds[7] ? $(tds[7]).text().trim() : "";
+
+      const { originGrade, suggestedGrade } = parseGrade(gradeRaw);
+      const { partners, note } = parseTitle(title);
+
+      const climb: Climb = {
+        date,
+        route,
+        area,
+        originGrade,
+        points,
+        style,
+        routeKey,
+        public: publicText.toLowerCase() === "x",
+      };
+
+      if (suggestedGrade) climb.suggestedGrade = suggestedGrade;
+      if (partners) climb.partners = partners;
+      if (note) climb.note = note;
+      if (attemptsText && !isNaN(Number(attemptsText))) {
+        climb.attempts = parseInt(attemptsText, 10);
+      }
+
+      climbs.push(climb);
+    }
+  });
+
+  return climbs;
+}
+
+// --- Route detail ---
 async function fetchRouteInfo(
   routeKey: string,
   retries = 3
@@ -64,12 +174,8 @@ async function fetchRouteInfo(
         if (cells.length === 2) {
           const label = $(cells[0]).text().trim();
           const value = $(cells[1]).text().trim();
-          if (label.startsWith("Sektor:")) {
-            sector = value;
-          }
-          if (label.startsWith("Poloha:")) {
-            location = value;
-          }
+          if (label.startsWith("Sektor:")) sector = value;
+          if (label.startsWith("Poloha:")) location = value;
         }
       });
 
@@ -83,103 +189,24 @@ async function fetchRouteInfo(
       }
     }
   }
-
   return {};
 }
 
+// --- Main ---
 async function main() {
   const USERNAME = process.env.LEZEC_USER;
   const PASSWORD = process.env.LEZEC_PASS;
-
   if (!USERNAME || !PASSWORD) {
     console.error("❌ Missing LEZEC_USER or LEZEC_PASS in .env file.");
     return;
   }
 
-  // 1. Login
-  const loginResponse = await client.post(
-    LOGIN_URL,
-    new URLSearchParams({
-      login: "2",
-      uid: USERNAME,
-      hes: PASSWORD,
-      x: "10",
-      y: "10",
-    }),
-    { responseType: "arraybuffer" }
-  );
+  await login(USERNAME, PASSWORD);
 
-  const cookies = loginResponse.headers["set-cookie"];
-  if (!cookies) {
-    console.error("❌ Login failed – no cookies received.");
-    return;
-  }
-  client.defaults.headers.Cookie = cookies.join("; ");
-  console.log("✅ Logged in to Lezec.cz");
-
-  // 2. Fetch diary page
   const diaryResponse = await client.get(DIARY_URL);
   const decodedHtml = iconv.decode(Buffer.from(diaryResponse.data), "win1250");
-  const $ = cheerio.load(decodedHtml);
+  const climbs = parseDiary(decodedHtml);
 
-  type Climb = {
-    date: string;
-    route: string;
-    area: string;
-    originGrade: string;
-    suggestedGrade?: string;
-    points: string;
-    style: string;
-    routeKey: string;
-    sector?: string;
-    crag?: string;
-    location?: string;
-  };
-
-  const climbs: Climb[] = [];
-
-  $("table tr").each((_, row) => {
-    const tds = $(row).find("td");
-    if (tds.length >= 6) {
-      const date = $(tds[0]).text().trim();
-      const route = $(tds[1]).text().trim();
-      const area = $(tds[2]).text().trim();
-      let gradeRaw = $(tds[3]).text().trim();
-      const points = $(tds[4]).text().trim();
-      const style = $(tds[5]).text().trim();
-
-      if (date.match(/^\d{2}\.\d{2}\.\d{4}$/)) {
-        const link = $(tds[1]).find("a").attr("href") || "";
-        const mkey = link.match(/key=(\d+)/);
-        const routeKey = mkey ? mkey[1] : "";
-
-        let originGrade = "";
-        let suggestedGrade: string | undefined = undefined;
-        const match = gradeRaw.match(/^(.+?)\s*\[(.+?)\]$/);
-        if (match) {
-          suggestedGrade = match[1].trim();
-          originGrade = match[2].trim();
-        } else {
-          originGrade = gradeRaw;
-        }
-
-        const climb: Climb = {
-          date,
-          route,
-          area,
-          originGrade,
-          points,
-          style,
-          routeKey,
-        };
-        if (suggestedGrade) climb.suggestedGrade = suggestedGrade;
-
-        climbs.push(climb);
-      }
-    }
-  });
-
-  // 3. Apply offset/limit
   const sliced = limit
     ? climbs.slice(offset, offset + limit)
     : climbs.slice(offset);
@@ -189,7 +216,6 @@ async function main() {
     } (offset=${offset}, limit=${limit ?? "∞"})`
   );
 
-  // 4. Route info only if flag is set
   if (fetchRouteInfoFlag) {
     console.log("🔎 Fetching route info...");
     let i = 0;
@@ -198,19 +224,17 @@ async function main() {
       if (climb.routeKey) {
         const info = await fetchRouteInfo(climb.routeKey);
         climb.sector = info.sector;
-        climb.crag = info.crag;
         climb.location = info.location;
         console.log(
           `   [${i}/${sliced.length}] ${climb.route} → ${
             climb.sector ?? "?"
-          }, ${climb.crag ?? "?"}, ${climb.location ?? "?"}`
+          }, ${climb.location ?? "?"}`
         );
-        await new Promise((res) => setTimeout(res, 1500)); // pauza mezi requesty
+        await new Promise((res) => setTimeout(res, 1500));
       }
     }
   }
 
-  // 5. Save file
   const filename = fetchRouteInfoFlag ? "climbs_with_crag.json" : "climbs.json";
   fs.writeFileSync(filename, JSON.stringify(sliced, null, 2), "utf-8");
   console.log(`💾 Saved ${sliced.length} climbs to ${filename}`);
